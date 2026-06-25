@@ -4,6 +4,7 @@ import { ENV } from "../config/env.js";
 export interface MetricResult {
   metric_name: string;
   score?: number;
+  verdict?: string;  // Add verdict field
   explanation?: string;
   error?: string;
 }
@@ -13,6 +14,7 @@ export interface EvalResult {
   // Legacy fields for backward compatibility
   metric_name?: string;
   score?: number;
+  verdict?: string;  // Add verdict field
   explanation?: string;
   error?: string;
 }
@@ -20,13 +22,20 @@ export interface EvalResult {
 /**
  * Call DeepEval service to evaluate using specified metric.
  * 
- * The new API expects: { query?, context?, output, metric, expected_output? }
+ * Part of the LLM Evaluation Framework - DeepEval provider
+ * 
+ * The API expects: { query?, context?, output, metric }
  * where:
  * - query: user's question
  * - context: array of retrieved documents/passages
- * - output: model's response
- * - metric: which metric to evaluate
- * - expected_output: reference answer (for contextual_* metrics)
+ * - output: LLM generated response
+ * - metric: evaluation metric (faithfulness, answer_relevancy, contextual_recall, ragas)
+ * 
+ * @param contextOrQuery - Context array or query string depending on metric
+ * @param output - LLM generated response to evaluate
+ * @param metric - Evaluation metric to use
+ * @param provider - Optional provider identifier
+ * @returns Promise with evaluation results
  */
 export async function evalWithMetric(
   contextOrQuery: string | string[],
@@ -60,14 +69,6 @@ export async function evalWithMetric(
     } else if (typeof contextOrQuery === "string") {
       payload.context = [contextOrQuery];  // Convert string to array
     }
-  } else if (metric === "contextual_precision" || metric === "contextual_recall") {
-    // contextual_* metrics require context array
-    if (Array.isArray(contextOrQuery)) {
-      payload.context = contextOrQuery;
-    } else if (typeof contextOrQuery === "string") {
-      payload.context = [contextOrQuery];
-    }
-    // Note: expected_output should be provided separately via a different parameter
   }
 
   if (provider) {
@@ -100,35 +101,34 @@ export async function evalWithFields(params: {
   query?: string;
   context?: string[];
   output?: string;
-  metric?: string;
   expected_output?: string;
+  metric?: string;
   provider?: string;
-  messages?: Array<{ role: string; content: string }>;
 }): Promise<EvalResult> {
   const payload: any = {
     metric: params.metric || "faithfulness",
   };
 
-  // For conversation_completeness, output is optional but messages is required
-  if (params.metric === "conversation_completeness") {
-    if (!params.messages) {
-      throw new Error("messages field is required for conversation_completeness metric");
-    }
-    payload.messages = params.messages;
-    // output is still required by the API, provide a default if not given
-    payload.output = params.output || "Conversation evaluation";
-  } else {
-    // For other metrics, output is required
-    if (!params.output) {
-      throw new Error("output field is required");
-    }
+  // Contextual metrics (contextual_precision, contextual_recall) do not require output
+  // They evaluate context quality based on expected_output
+  const metricsNotRequiringOutput = ["contextual_precision", "contextual_recall"];
+  const metricName = params.metric || "faithfulness";
+  
+  if (!metricsNotRequiringOutput.includes(metricName) && !params.output) {
+    throw new Error("output field is required");
+  }
+  
+  // Only include output if it's provided
+  if (params.output) {
     payload.output = params.output;
   }
 
   if (params.query) payload.query = params.query;
   if (params.context) payload.context = params.context;
-  if (params.expected_output) payload.expected_output = params.expected_output;
+  if (params.expected_output) payload.expected_output = params.expected_output;  // NEW: Pass expected_output
   if (params.provider) payload.provider = params.provider;
+
+  console.log(`evalWithFields - Sending payload:`, JSON.stringify(payload, null, 2));
 
   try {
     const res = await axios.post<EvalResult>(ENV.DEEPEVAL_URL, payload);
@@ -150,6 +150,33 @@ export async function evalWithFields(params: {
 }
 
 /**
+ * Evaluate conversation completeness using multi-turn conversation turns
+ */
+export async function evalWithConversational(
+  turns: Array<{ role: string; content: string }>
+): Promise<EvalResult> {
+  const conversationalUrl = ENV.DEEPEVAL_URL + '/conversational';
+
+  try {
+    const res = await axios.post<EvalResult>(conversationalUrl, { turns });
+    return res.data;
+  } catch (err: unknown) {
+    if (axios.isAxiosError(err)) {
+      if ((err as any).code === "ECONNREFUSED") {
+        throw new Error(
+          `DeepEval service unavailable at ${conversationalUrl}. Is it running?`
+        );
+      }
+      const errorDetail = err.response?.data?.detail || err.message;
+      throw new Error(
+        `DeepEval Error (${err.response?.status || 'unknown'}): ${errorDetail}`
+      );
+    }
+    throw err;
+  }
+}
+
+/**
  * Legacy function for backward compatibility - defaults to faithfulness
  */
 export async function evalFaithfulness(
@@ -159,3 +186,6 @@ export async function evalFaithfulness(
 ): Promise<EvalResult> {
   return evalWithMetric(contextOrQuery, output, "faithfulness", provider);
 }
+//RAGAS
+// ...existing code...
+

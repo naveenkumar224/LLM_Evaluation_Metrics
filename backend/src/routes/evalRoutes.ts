@@ -1,6 +1,6 @@
 import { Router, Request, Response, NextFunction } from "express";
 import { callLLM } from "../services/llmClient.js";
-import { evalWithMetric, evalWithFields, evalFaithfulness } from "../services/evalClient.js";
+import { evalWithMetric, evalWithFields, evalFaithfulness, evalWithConversational } from "../services/evalClient.js";
 import { retrieveContext } from "../services/ragService.js";
 import { ENV } from "../config/env.js";
 
@@ -56,7 +56,7 @@ router.post(
     }
 
     // Determine effective parameters
-    const effectiveModel = model || "llama-3.3-70b-versatile";
+    const effectiveModel = model || "testleaf-gpt-4o-mini";
     const effectiveTemperature = temperature !== undefined ? temperature : 0.7;
     const effectiveMetric = metric || "answer_relevancy"; // Changed default from faithfulness
 
@@ -65,8 +65,10 @@ router.post(
     console.log("LLM Response:", llmResponse);
 
     // Determine provider based on model
-    const provider = effectiveModel.startsWith("llama-") || effectiveModel.startsWith("mixtral-") || 
-                     effectiveModel.startsWith("gemma") || effectiveModel.startsWith("qwen") ? "groq" : "openai";
+    const provider = effectiveModel.startsWith("testleaf-") ? "testleaf"
+      : (effectiveModel.startsWith("llama-") || effectiveModel.startsWith("mixtral-") ||
+         effectiveModel.startsWith("gemma") || effectiveModel.startsWith("qwen")) ? "groq"
+      : "openai";
 
     // Evaluate with DeepEval using specified metric
     // For LLM-only (no RAG), answer_relevancy makes most sense
@@ -138,7 +140,7 @@ router.post(
     }
 
     // Determine effective parameters
-    const effectiveModel = model || "llama-3.3-70b-versatile";
+    const effectiveModel = model || "testleaf-gpt-4o-mini";
     const effectiveTemperature = temperature !== undefined ? temperature : 0.7;
     const effectiveMetric = metric || "faithfulness";
 
@@ -160,8 +162,10 @@ ANSWER:`;
     const llmResponse = await callLLM(ragPrompt, effectiveModel, effectiveTemperature);
 
     // Determine provider based on model
-    const provider = effectiveModel.startsWith("llama-") || effectiveModel.startsWith("mixtral-") || 
-                     effectiveModel.startsWith("gemma") || effectiveModel.startsWith("qwen") ? "groq" : "openai";
+    const provider = effectiveModel.startsWith("testleaf-") ? "testleaf"
+      : (effectiveModel.startsWith("llama-") || effectiveModel.startsWith("mixtral-") ||
+         effectiveModel.startsWith("gemma") || effectiveModel.startsWith("qwen")) ? "groq"
+      : "openai";
 
     // 4. Evaluate using specified metric
     // For RAG, we have context (as array) and output
@@ -204,101 +208,178 @@ router.get("/health", (req: Request, res: Response) => {
 
 /**
  * POST /eval-only
- * Evaluate existing query-output pairs without LLM generation
+ * DeepEval evaluation endpoint (same format as RAGAS)
  * 
  * Request body:
  * {
- *   query?: string - the input question (required for answer_relevancy),
- *   output?: string - the response to evaluate (required for most metrics),
+ *   query?: string - the input question,
+ *   output?: string - the response to evaluate (required for most metrics, NOT required for contextual_precision and contextual_recall),
  *   context?: string | string[] - context for faithfulness evaluation,
- *   expected_output?: string - reference answer (for contextual_* metrics),
- *   messages?: Array<{role: string, content: string}> - conversation turns (required for conversation_completeness),
+ *   expected_output?: string - reference/expected answer (required for contextual_precision and contextual_recall),
  *   metric?: string (optional, defaults to 'answer_relevancy')
  * }
  *
  * Response:
  * {
+ *   metric: string,
+ *   score: number,
+ *   verdict: string,
+ *   explanation: string,
  *   query?: string,
- *   output?: string,
- *   context?: string[],
- *   expected_output?: string,
- *   messages?: Array<{role: string, content: string}>,
- *   evaluation: { metric, score, explanation }
+ *   output?: string (not included for contextual metrics),
+ *   context?: string[]
  * }
  */
 router.post(
   "/eval-only",
   asyncHandler(async (req: Request, res: Response) => {
-    const { query, output, context, expected_output, metric, messages } = req.body;
+    const { query, output, context, metric, expected_output } = req.body;
 
     // Validation
-    if (!output && !messages) {
+    // Output is NOT required for contextual_precision and contextual_recall (context quality metrics)
+    const effectiveMetric = metric || "answer_relevancy";
+    const metricsNotRequiringOutput = ["contextual_precision", "contextual_recall"];
+    
+    if (!metricsNotRequiringOutput.includes(effectiveMetric) && !output) {
       return res.status(400).json({
-        error: "Missing required field: output or messages (for conversation_completeness)"
+        error: "Missing required field: output"
+      });
+    }
+    if (effectiveMetric === "pii_leakage" && !query) {
+      return res.status(400).json({
+        error: "Missing required field: query (required for pii_leakage metric)"
+      });
+    }
+    if (effectiveMetric === "bias" && !query) {
+      return res.status(400).json({
+        error: "Missing required field: query (required for bias metric)"
+      });
+    }
+    if (effectiveMetric === "hallucination" && !query) {
+      return res.status(400).json({
+        error: "Missing required field: query (required for hallucination metric)"
+      });
+    }
+    if (effectiveMetric === "hallucination" && !context) {
+      return res.status(400).json({
+        error: "Missing required field: context (required for hallucination metric)"
+      });
+    }
+    if (effectiveMetric === "hallucination" && Array.isArray(context) && context.length === 0) {
+      return res.status(400).json({
+        error: "Context cannot be empty for hallucination metric (requires at least one context item)"
       });
     }
 
-    // Determine effective metric
-    const effectiveMetric = metric || "answer_relevancy";
+    try {
+      // Build evaluation parameters
+      const evalParams: any = {
+        metric: effectiveMetric,
+        provider: req.body.provider || "groq",  // Use provider from request, default to groq
+        output: output
+      };
 
-    // Build evaluation parameters based on what's provided
-    const evalParams: any = {
-      metric: effectiveMetric,
-      provider: "groq"
-    };
+      if (query) evalParams.query = query;
+      if (context) evalParams.context = Array.isArray(context) ? context : [context];
+      if (expected_output) evalParams.expected_output = expected_output;
 
-    // Add output if provided (required for most metrics)
-    if (output) {
-      evalParams.output = output;
-    }
+      console.log(`DeepEval - Metric: ${effectiveMetric}`);
+      console.log(`DeepEval - Full evalParams:`, JSON.stringify(evalParams, null, 2));
+      if (query) console.log(`Query: ${query.substring(0, 80)}...`);
+      if (output) console.log(`Output: ${output.substring(0, 80)}...`);
+      if (context) console.log(`Context:`, JSON.stringify(context, null, 2));
 
-    // Add query if provided
-    if (query) {
-      evalParams.query = query;
-    }
+      // Evaluate using DeepEval
+      const evalResult = await evalWithFields(evalParams);
 
-    // Add context if provided (convert string to array if needed)
-    if (context) {
-      evalParams.context = Array.isArray(context) ? context : [context];
-    }
+      console.log("DeepEval Raw Response:", JSON.stringify(evalResult, null, 2));
 
-    // Add expected_output if provided
-    if (expected_output) {
-      evalParams.expected_output = expected_output;
-    }
-
-    // Add messages if provided (for conversation_completeness)
-    if (messages) {
-      evalParams.messages = messages;
-    }
-
-    console.log(`Direct evaluation - Metric: ${effectiveMetric}`);
-    if (query) console.log(`Query: ${query}`);
-    if (context) console.log(`Context: ${Array.isArray(context) ? context.length + ' items' : context.substring(0, 100) + '...'}`);
-    if (output) console.log(`Output: ${output.substring(0, 100)}...`);
-    if (messages) console.log(`Messages: ${messages.length} conversation turns`);
-
-    // Evaluate using specified metric (no LLM generation needed)
-    const evalResult = await evalWithFields(evalParams);
-
-    const response: any = {
-      evaluation: {
-        metric: evalResult.metric_name,
-        score: evalResult.score,
-        explanation: evalResult.explanation,
-        // Include results array if available for multi-metric support
-        ...(evalResult.results && { results: evalResult.results })
+      // The Python API returns: { results: [...], metric_name, score, explanation }
+      // Extract verdict from results array (it's not at top level)
+      let verdict: string | undefined = undefined;
+      
+      if (evalResult.results && Array.isArray(evalResult.results) && evalResult.results.length > 0) {
+        const firstResult = evalResult.results[0];
+        verdict = firstResult.verdict;
+        console.log("✓ Extracted verdict from results[0]:", verdict);
       }
-    };
 
-    // Include optional fields in response if they were provided
-    if (output) response.output = output;
-    if (query) response.query = query;
-    if (context) response.context = evalParams.context;
-    if (expected_output) response.expected_output = expected_output;
-    if (messages) response.messages = messages;
+      // Return in same format as RAGAS for frontend consistency
+      const response: any = {
+        metric: evalResult.metric_name || effectiveMetric,
+        score: evalResult.score,
+        verdict: verdict,  // Include verdict from results array
+        explanation: evalResult.explanation,
+        output: output
+      };
 
-    res.json(response);
+      if (query) response.query = query;
+      if (evalParams.context) response.context = evalParams.context;
+
+      console.log("Backend Response being sent to frontend:", JSON.stringify(response, null, 2));
+      res.json(response);
+
+    } catch (error) {
+      console.error("DeepEval evaluation error:", error);
+      res.status(500).json({
+        error: "DeepEval evaluation failed",
+        details: error instanceof Error ? error.message : "Unknown error"
+      });
+    }
+  })
+);
+
+
+
+/**
+ * POST /eval-conversational
+ * Conversation Completeness evaluation endpoint
+ *
+ * Request body:
+ * {
+ *   turns: Array<{ role: "user" | "assistant", content: string }>
+ * }
+ */
+router.post(
+  "/eval-conversational",
+  asyncHandler(async (req: Request, res: Response) => {
+    const { turns } = req.body;
+
+    if (!turns || !Array.isArray(turns) || turns.length < 2) {
+      return res.status(400).json({
+        error: "At least 2 turns (user + assistant) are required"
+      });
+    }
+
+    for (const turn of turns) {
+      if (!turn.role || !turn.content) {
+        return res.status(400).json({
+          error: "Each turn must have a role ('user' or 'assistant') and content"
+        });
+      }
+    }
+
+    try {
+      const evalResult = await evalWithConversational(turns);
+
+      let verdict: string | undefined = undefined;
+      if (evalResult.results && Array.isArray(evalResult.results) && evalResult.results.length > 0) {
+        verdict = evalResult.results[0].verdict;
+      }
+
+      res.json({
+        metric: 'conversation_completeness',
+        score: evalResult.score,
+        verdict: verdict,
+        explanation: evalResult.explanation,
+      });
+    } catch (error) {
+      console.error("Conversational evaluation error:", error);
+      res.status(500).json({
+        error: "Conversational evaluation failed",
+        details: error instanceof Error ? error.message : "Unknown error"
+      });
+    }
   })
 );
 
@@ -316,15 +397,13 @@ router.get("/metrics", async (req: Request, res: Response) => {
       ...metricsInfo,
       usage_examples: {
         faithfulness: "Measures alignment with provided context - ideal for RAG systems",
-        answer_relevancy: "Measures how well the answer addresses the question - good for QA systems", 
-        contextual_precision: "Measures precision of retrieved context - useful for retrieval evaluation",
-        contextual_recall: "Measures coverage of expected information - helpful for completeness checking"
+        answer_relevancy: "Measures how well the answer addresses the question - good for QA systems"
       }
     });
   } catch (error) {
     res.status(500).json({
       error: "Could not fetch metrics information",
-      available_metrics: ["faithfulness", "answer_relevancy", "contextual_precision", "contextual_recall"]
+      available_metrics: ["faithfulness", "answer_relevancy"]
     });
   }
 });
