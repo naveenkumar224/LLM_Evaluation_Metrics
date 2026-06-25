@@ -45,12 +45,37 @@ async function callGroq(prompt: string, model: string, temperature: number = 0.7
   return res.data.choices[0].message.content as string;
 }
 
+/**
+ * Call Testleaf API (OpenAI-compatible)
+ */
+async function callTestleaf(prompt: string, model: string, temperature: number = 0.7): Promise<string> {
+  const res = await axios.post(
+    "https://api.testleaf.com/ai/v1/chat/completions",
+    {
+      model,
+      messages: [{ role: "user", content: prompt }],
+      temperature
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${ENV.TESTLEAF_API_KEY}`,
+        "Content-Type": "application/json"
+      }
+    }
+  );
+
+  return res.data.choices[0].message.content as string;
+}
+
 
 
 /**
  * Determine which provider to use based on model name
  */
-function getProvider(model: string): "openai" | "groq" {
+function getProvider(model: string): "openai" | "groq" | "testleaf" {
+  if (model.startsWith("testleaf-")) {
+    return "testleaf";
+  }
   // Groq models start with: llama-, mixtral-, gemma, qwen
   const groqPrefixes = ["llama-", "mixtral-", "gemma", "qwen"];
   if (groqPrefixes.some(prefix => model.startsWith(prefix))) {
@@ -68,7 +93,7 @@ export async function callLLM(
   model?: string,
   temperature?: number
 ): Promise<string> {
-  const selectedModel = model || "llama-3.3-70b-versatile"; // Default to Groq model
+  const selectedModel = model || "testleaf-gpt-4o-mini";
   const selectedTemperature = temperature !== undefined ? temperature : 0.7; // Default temperature
 
   if (!prompt || prompt.trim() === "") {
@@ -83,7 +108,9 @@ export async function callLLM(
   console.log(`Using provider: ${provider}, model: ${selectedModel}, temperature: ${selectedTemperature}`);
 
   try {
-    if (provider === "groq") {
+    if (provider === "testleaf") {
+      return await callTestleaf(prompt, selectedModel, selectedTemperature);
+    } else if (provider === "groq") {
       return await callGroq(prompt, selectedModel, selectedTemperature);
     } else {
       return await callOpenAI(prompt, selectedModel, selectedTemperature);
